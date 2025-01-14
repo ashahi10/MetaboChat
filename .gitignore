@@ -1,0 +1,25 @@
+# Ignore Python cache and virtual environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.venv/
+env/
+venv/
+*.log
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore Hugging Face token file
+.env
+
+# Ignore Neo4j files (optional)
+data/
+logs/
+
+# Ignore large files
+*.safetensors
+*.ckpt
