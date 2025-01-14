@@ -1,0 +1,8 @@
+neo4j
+pandas
+requests
+transformers
+rdflib
+torch
+huggingface_hub
+python-dotenv
