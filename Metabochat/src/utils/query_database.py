@@ -30,6 +30,7 @@ def query_by_disease(disease):
     conn.close()
     return results
 #yo
+#
 
 def query_by_pathway(pathway):
     """
