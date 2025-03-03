@@ -177,7 +177,7 @@ def main():
     Main function for user interaction and response generation.
     """
     print("Welcome to MetaboChat!")
-    print("Ask questions naturally, and the system will provide responses based on database knowledge and LLM insights.")
+    print("Ask questions naturally and deepseek will provide you with the most relevant information.")
 
     while True:
         prompt = input("\nEnter your query (or type 'exit' to quit): ").strip()

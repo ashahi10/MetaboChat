@@ -1,0 +1,11 @@
+<ns0:protein xmlns:ns0="http://www.hmdb.ca">
+      <ns0:protein_accession>HMDBP00054</ns0:protein_accession>
+      <ns0:name>Dihydrolipoyl dehydrogenase, mitochondrial</ns0:name>
+      <ns0:uniprot_id>P09622</ns0:uniprot_id>
+      <ns0:gene_name>DLD</ns0:gene_name>
+      <ns0:protein_type>Unknown</ns0:protein_type>
+    </ns0:protein>
+    
+
+================================================================================
+
