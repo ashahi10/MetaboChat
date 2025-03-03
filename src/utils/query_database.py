@@ -25,18 +25,72 @@ class PostgresDBHandler:
             port=self.port
         )
 
+    ######################################################
+    #  refresh_doc_column
+    ######################################################
+    def refresh_doc_column(self):
+        """
+        Rebuild or refresh the weighted 'doc' tsvector column in 'metabolites'
+        by merging:
+          - name => weight 'A'
+          - synonyms => 'C'
+          - diseases => 'C'
+          - pathways => 'D'
+        Then re-run to keep updated if data changes.
+        """
+        with self._connect() as conn:
+            cur = conn.cursor()
+            # 1) name (A) + synonyms (C)
+            cur.execute("""
+                UPDATE metabolites
+                   SET doc =
+                     setweight(to_tsvector('english', COALESCE(name,'')), 'A') ||
+                     setweight(to_tsvector('english', COALESCE(synonyms::text,'')), 'C')
+            """)
+
+            # 2) diseases => 'C'
+            cur.execute("""
+                WITH disease_texts AS (
+                  SELECT metabolite_id,
+                         string_agg(disease_name, ' ') AS disease_str
+                    FROM diseases
+                   GROUP BY metabolite_id
+                )
+                UPDATE metabolites m
+                   SET doc = m.doc || setweight(to_tsvector('english', COALESCE(d.disease_str,'')), 'C')
+                  FROM disease_texts d
+                 WHERE d.metabolite_id = m.id
+            """)
+
+            # 3) pathways => 'D'
+            cur.execute("""
+                WITH pathway_texts AS (
+                  SELECT metabolite_id,
+                         string_agg(pathway_name, ' ') AS path_str
+                    FROM pathways
+                   GROUP BY metabolite_id
+                )
+                UPDATE metabolites m
+                   SET doc = m.doc || setweight(to_tsvector('english', COALESCE(p.path_str,'')), 'D')
+                  FROM pathway_texts p
+                 WHERE p.metabolite_id = m.id
+            """)
+
+            conn.commit()
+            print("Refreshed 'doc' column with weighting: name=A, synonyms/diseases=C, pathways=D.")
+
     ############################################
     # FULL-TEXT SEARCH with Weighted Fields
     ############################################
     def full_text_search(self, term, limit=5):
         """
-        Search the weighted 'doc' column in 'metabolites'.
-        - We use plainto_tsquery(...) so it handles multi-word input gracefully.
-        - We rank results via ts_rank_cd, which respects the weighting we assigned.
+        Weighted FTS on the 'doc' column.
+        If no hits, fallback to partial ILIKE on name/synonyms.
         """
         with self._connect() as conn:
             cur = conn.cursor()
-            query = """
+            # Weighted search using ts_rank_cd
+            query_fts = """
                 SELECT id, hmdb_id, name,
                        ts_rank_cd(doc, plainto_tsquery('english', %s)) AS rank
                   FROM metabolites
@@ -44,20 +98,29 @@ class PostgresDBHandler:
                  ORDER BY rank DESC
                  LIMIT %s;
             """
-            cur.execute(query, (term, term, limit))
+            cur.execute(query_fts, (term, term, limit))
+            rows = cur.fetchall()
+            if rows:
+                return rows
+
+            # Fallback partial match
+            query_fallback = """
+                SELECT id, hmdb_id, name
+                  FROM metabolites
+                 WHERE name ILIKE %s
+                    OR synonyms::text ILIKE %s
+                 LIMIT %s
+            """
+            cur.execute(query_fallback, (f"%{term}%", f"%{term}%", limit))
             return cur.fetchall()
 
     ############################################
-    # Query by exact/partial Name
+    # Query by Name (Exact -> partial fallback)
     ############################################
     def query_by_name(self, name, limit=5):
-        """
-        1) Exact match on 'name' (case-insensitive).
-        2) If none found, partial match on name or synonyms.
-        """
         with self._connect() as conn:
             cur = conn.cursor()
-            # 1) exact
+            # exact
             cur.execute("""
                 SELECT id, hmdb_id, name, chemical_formula
                   FROM metabolites
@@ -68,7 +131,7 @@ class PostgresDBHandler:
             if rows:
                 return rows
 
-            # 2) partial
+            # partial
             cur.execute("""
                 SELECT id, hmdb_id, name, chemical_formula
                   FROM metabolites
@@ -79,14 +142,9 @@ class PostgresDBHandler:
             return cur.fetchall()
 
     ############################################
-    # Query by Disease
+    # Query by Disease (Exact -> partial)
     ############################################
     def query_by_disease(self, disease, limit=5):
-        """
-        Join 'diseases' => 'metabolites'.
-        1) exact match
-        2) partial fallback
-        """
         with self._connect() as conn:
             cur = conn.cursor()
             # exact
@@ -97,9 +155,9 @@ class PostgresDBHandler:
                  WHERE lower(d.disease_name) = lower(%s)
                  LIMIT %s
             """, (disease, limit))
-            rows = cur.fetchall()
-            if rows:
-                return rows
+            exact = cur.fetchall()
+            if exact:
+                return exact
 
             # partial
             cur.execute("""
@@ -112,13 +170,9 @@ class PostgresDBHandler:
             return cur.fetchall()
 
     ############################################
-    # Query by Pathway
+    # Query by Pathway (Exact -> partial)
     ############################################
     def query_by_pathway(self, pathway, limit=5):
-        """
-        Join 'pathways' => 'metabolites'.
-        Exact + partial fallback.
-        """
         with self._connect() as conn:
             cur = conn.cursor()
             # exact
@@ -129,9 +183,9 @@ class PostgresDBHandler:
                  WHERE lower(p.pathway_name) = lower(%s)
                  LIMIT %s
             """, (pathway, limit))
-            exact = cur.fetchall()
-            if exact:
-                return exact
+            rows = cur.fetchall()
+            if rows:
+                return rows
 
             # partial
             cur.execute("""
@@ -148,11 +202,10 @@ class PostgresDBHandler:
     ############################################
     def query_predicted_properties(self, hmdb_id):
         """
-        Return predicted properties (logP, pKa, etc.) for a given metabolite.
+        Return predicted props (logP, pKa, etc.) for HMDB ID
         """
         with self._connect() as conn:
             cur = conn.cursor()
-            # get metabolite ID
             cur.execute("SELECT id FROM metabolites WHERE hmdb_id = %s", (hmdb_id,))
             row = cur.fetchone()
             if not row:
@@ -170,9 +223,6 @@ class PostgresDBHandler:
     # Concentrations
     ############################################
     def query_concentrations(self, hmdb_id, ctype='normal'):
-        """
-        Return normal/abnormal concentrations for HMDB ID.
-        """
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("SELECT id FROM metabolites WHERE hmdb_id = %s", (hmdb_id,))
@@ -194,9 +244,6 @@ class PostgresDBHandler:
     # Proteins
     ############################################
     def query_proteins(self, hmdb_id):
-        """
-        Return proteins that link to the given metabolite (by HMDB ID).
-        """
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("SELECT id FROM metabolites WHERE hmdb_id = %s", (hmdb_id,))
@@ -213,12 +260,14 @@ class PostgresDBHandler:
             return cur.fetchall()
 
 #######################################
-# Simple Testing
+# Demo Testing
 #######################################
 if __name__ == "__main__":
-    db = PostgresDBHandler(
-        password="your_password"  # Adjust as needed
-    )
+    db = PostgresDBHandler(password="your_password")  # adjust as needed
+
+    print("If you haven't done so, make sure you've run the lines to add doc column, GIN index, and then call `db.refresh_doc_column()` once ingestion is done.\n")
+
+    # db.refresh_doc_column()  # Uncomment if you want to forcibly rebuild doc
 
     print("\n=== Weighted FTS Test ===")
     for t in ["glucose", "serotonin", "oxidative stress", "nonexisting"]:

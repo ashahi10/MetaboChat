@@ -1,40 +1,71 @@
+#!/usr/bin/env python3
+
 import time
 start = time.time()
 
-import openai
 import sys
 import os
 import re
+import openai
 
 end = time.time()
 print(f"Import time: {end - start:.4f} seconds")
 
-# Add the `src` directory to Python's module path
+# Ensure we can import our query_database script
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from utils.query_database import DatabaseHandler  # Now it should work
+# 1) Use the newly updated PostgresDBHandler from your final query_database.py
+from utils.query_database import PostgresDBHandler
 
-# Initialize the Groq API client for OpenAI-compatible calls
-client = openai.OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.environ.get("groq"),
+###########################################
+# LLM (Groq or OpenAI-compatible) Setup
+###########################################
+# If you're using Groq for the LLM calls, do this:
+# client = openai.OpenAI(
+#     base_url="https://api.groq.com/openai/v1",
+#     api_key=os.environ.get("groq"),
+# )
+
+# Or if you use standard OpenAI:
+# openai.api_key = os.environ["OPENAI_API_KEY"]
+# client = openai
+
+# Example placeholder:
+client = openai  # Adjust as needed for your environment
+
+# This is your chosen model (Groq or openai)
+model_id = "gpt-3.5-turbo"  # or "deepseek-r1-distill-llama-70b"
+
+###########################################
+# Initialize DB Handler
+###########################################
+db_handler = PostgresDBHandler(
+    dbname="metabolites_pg",
+    user="postgres",
+    password="your_password",
+    host="localhost",
+    port="5432"
 )
 
-# Model ID for DeepSeek (via Groq)
-model_id = "deepseek-r1-distill-llama-70b"
-
-# Initialize the database handler
-db_handler = DatabaseHandler()
-
+###########################################
+# UTILS
+###########################################
 def extract_keywords(prompt):
     """
-    Extracts potential keywords or phrases from the user's input for optimized database searching.
+    Extract potential keywords from the user's prompt:
+     - name
+     - disease
+     - pathway
+    If none, we might fallback on full_text_search.
     """
     keywords = {}
 
+    # Basic detection via simple regex
     name_match = re.search(r'name\s*[:\- ]*([\w\s]+)', prompt, re.IGNORECASE)
     disease_match = re.search(r'disease\s*[:\- ]*([\w\s]+)', prompt, re.IGNORECASE)
-    pathway_match = re.search(r'(\b\w+lysis\b|\b\w+genesis\b|\b\w+cycle\b|\b\w+pathway\b)', prompt, re.IGNORECASE)
+    # Also catch "diabetes" or "cancer" type references
+    pathway_match = re.search(r'(glycolysis|gluconeogenesis|\b\w+lysis\b|\b\w+genesis\b|\b\w+cycle\b|\b\w+pathway\b)', 
+                              prompt, re.IGNORECASE)
 
     if name_match:
         keywords['name'] = name_match.group(1).strip()
@@ -43,164 +74,165 @@ def extract_keywords(prompt):
     if pathway_match:
         keywords['pathway'] = pathway_match.group(0).strip()
 
-    search_terms = re.findall(r'\b(?:related to|about|regarding|linked to|involved in|causes)\s+([\w\s]+)', prompt, re.IGNORECASE)
-    if search_terms:
-        keywords['search'] = search_terms[0].strip()
-
     return keywords
 
 def query_database(prompt):
     """
-    Queries the database based on extracted keywords.
+    Decide how to query the DB based on extracted keywords:
+      1) name => query_by_name
+      2) disease => query_by_disease
+      3) pathway => query_by_pathway
+      If none => fallback to full_text_search on the entire prompt
+    Returns (formatted_str, raw_rows, columns_used)
     """
     keywords = extract_keywords(prompt)
 
+    # if user specifically gave a name/disease/pathway, we use direct queries
     if 'name' in keywords:
-        results = db_handler.query_by_name(keywords['name'])
-        return format_results(results, ["Name", "Short Description", "Diseases"]), results, ["Name", "Short Description", "Diseases"]
+        rows = db_handler.query_by_name(keywords['name'], limit=5)
+        if not rows:
+            # fallback to FTS on the name
+            rows = db_handler.full_text_search(keywords['name'], limit=5)
+            return format_results(rows, ["ID", "HMDB_ID", "Name", "Rank" if len(rows) and len(rows[0]) > 3 else None]), rows, ["ID", "HMDB_ID", "Name"]
+
+        return format_results(rows, ["ID", "HMDB_ID", "Name", "Formula"]), rows, ["ID", "HMDB_ID", "Name", "Formula"]
 
     if 'disease' in keywords:
-        results = db_handler.query_by_disease(keywords['disease'])
-        return format_results(results, ["Name", "Short Description"]), results, ["Name", "Short Description"]
+        rows = db_handler.query_by_disease(keywords['disease'], limit=5)
+        return format_results(rows, ["ID", "HMDB_ID", "Name", "Disease"]), rows, ["ID", "HMDB_ID", "Name", "Disease"]
 
     if 'pathway' in keywords:
-        results = db_handler.query_by_pathway(keywords['pathway'])
-        return format_results(results, ["Name", "Short Description"]), results, ["Name", "Short Description"]
+        rows = db_handler.query_by_pathway(keywords['pathway'], limit=5)
+        return format_results(rows, ["ID", "HMDB_ID", "Name", "Pathway"]), rows, ["ID", "HMDB_ID", "Name", "Pathway"]
 
-    if 'search' in keywords:
-        results = db_handler.full_text_search(keywords['search'])
-        return format_results(results, ["Name", "Description", "Diseases", "Pathways"]), results, ["Name", "Description", "Diseases", "Pathways"]
+    # else: no direct field => fallback full-text across doc
+    rows = db_handler.full_text_search(prompt, limit=5)
+    if rows:
+        # If the row structure is (id, hmdb_id, name, rank), let's label them
+        return format_results(rows, ["ID", "HMDB_ID", "Name", "Rank"]), rows, ["ID", "HMDB_ID", "Name", "Rank"]
+    return "No relevant database entries found.", None, None
 
-    return None, None, None
-
-def format_results(results, headers, max_items=10):
+def format_results(rows, headers, max_items=10):
     """
-    Formats the database query results for better readability using bullet points.
-    Limits long lists (diseases, pathways, metabolites) to improve clarity.
+    Format the row data using bullet points, ignoring null fields.
     """
-    if not results:
+    if not rows:
         return "No relevant database entries found."
 
-    formatted = []
-    for row in results:
-        row_dict = {headers[i]: str(value).encode('utf-8', 'ignore').decode('utf-8') for i, value in enumerate(row)}
-
-        # Limit long lists in diseases & pathways
-        for key in ["Diseases", "Pathways"]:
-            if key in row_dict:
-                items = row_dict[key].split(", ")
-                if len(items) > max_items:
-                    row_dict[key] = ", ".join(items[:max_items]) + ", [...] (More omitted)"
-
-        formatted_row = "\n".join([f"- {key}: {value}" for key, value in row_dict.items()])
-        formatted.append(formatted_row)
-        formatted.append("")  # Blank line between rows
-
-    return "\n".join(formatted)
-
+    lines = []
+    for row in rows:
+        row_strs = []
+        # tie each row element to the matching header
+        for i, h in enumerate(headers):
+            if not h:
+                continue
+            if i < len(row):
+                val = str(row[i])
+                # e.g. if val is "None", skip or set empty
+                if val.lower() == "none":
+                    val = ""
+                row_strs.append(f"- {h}: {val}")
+        lines.append("\n".join(row_strs))
+    return "\n\n".join(lines)
 
 def clean_response(response_text):
     """
-    Cleans up LLM output by:
-    - Keeping structured formatting (bullets, bold headings).
-    - Removing duplicate new lines.
-    - Fixing any weird encoding issues.
+    Cleans up LLM output:
+      - remove weird spacing
+      - unify newlines
     """
-    cleaned = response_text.encode('utf-8', 'ignore').decode('utf-8')  # Fix Unicode errors
-
-    # Remove excessive new lines & extra spaces
+    cleaned = response_text.encode('utf-8', 'ignore').decode('utf-8')
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
-    
     return cleaned
-
 
 def generate_response(prompt):
     """
-    Generates a response using the DeepSeek model via Groq API.
+    Generates a response from the LLM. 
+    If you're using Groq or openai, adapt accordingly.
     """
-    try:
-        if not prompt.strip():
-            return "Error: No valid input provided."
+    if not prompt.strip():
+        return "Error: No valid input provided."
 
-        print("Generating response...")
-        response = client.chat.completions.create(
+    # Example using openai
+    try:
+        print("Generating LLM response...")
+        response = client.ChatCompletion.create(
+            model=model_id,
             messages=[
                 {"role": "system", "content": (
-                    "You are an expert scientific assistant. Provide only direct, concise, and well-organized answers based solely on the provided database information. "
-                    "Do NOT include any internal chain-of-thought or reasoning markers. Avoid repetition and do not hallucinate details. "
-                    "When comparing data, use a clear table format."
+                    "You are an expert scientific assistant. Provide direct, concise, well-organized answers based solely on the provided database info. "
+                    "Do not show your chain-of-thought. Keep answers short and factual. "
+                    "When comparing or enumerating data, use bullet points or a table."
                 )},
                 {"role": "user", "content": prompt}
             ],
-            model=model_id,
-            max_tokens=512,  # Reduced for conciseness
-            temperature=0.5,  # Moderate randomness
+            max_tokens=512,
+            temperature=0.3,
         )
-
-        final_response = response.choices[0].message.content.strip()
-        final_response = final_response.encode('utf-8').decode('utf-8')
-        return clean_response(final_response)
-
+        content = response["choices"][0]["message"]["content"].strip()
+        return clean_response(content)
     except Exception as e:
         return f"Error generating response: {e}"
 
 def synthesize_response(user_prompt, db_response):
     """
-    Synthesizes a final answer using both database knowledge and LLM-generated insights.
-    Ensures LLM provides useful context if no database match.
-    Enforces a strict table format for comparison queries.
+    Combines DB knowledge with LLM summary.
+    If db_response is "No relevant database entries found", let LLM respond freely.
+    Otherwise, pass the DB data + user query for final summarization.
     """
     if not db_response or db_response.strip() == "No relevant database entries found.":
-        return generate_response(f"The database has no direct match for '{user_prompt}'. "
-                                 "However, provide a scientific explanation related to the topic.")
+        # Let LLM generate an answer with no data
+        return generate_response(f"No direct database match for '{user_prompt}'. Provide a short scientific explanation.")
 
-    # Check if user is requesting a comparison (to enforce table format)
+    # If there's data, we instruct the LLM to summarize
+    # Check if user might want a comparison
     comparative = re.search(r'\b(compare|vs\.?|versus|differences|similarities|contrast)\b', user_prompt, re.IGNORECASE)
     if comparative:
         extra_instructions = (
-            "Provide a side-by-side table comparison using ONLY the provided database data. "
-            "Ensure key differences and similarities are clearly shown. "
-            "Use proper column headers and structured formatting."
+            "Provide a side-by-side table using only the database data. "
+            "Highlight key differences and similarities in each column."
         )
     else:
         extra_instructions = (
-            "Summarize database data in bullet points (max 150 words). "
-            "If data is insufficient, state that clearly."
+            "Summarize the database data in bullet points (max 150 words). "
+            "If data is insufficient, say so."
         )
 
-    enriched_prompt = f"User Query: {user_prompt}\n\nDatabase Information:\n{db_response}\n\nInstructions: {extra_instructions}"
-    return generate_response(enriched_prompt)
+    combined_prompt = f"User Query:\n{user_prompt}\n\nDatabase Results:\n{db_response}\n\nInstructions:\n{extra_instructions}"
+    return generate_response(combined_prompt)
 
-
+#######################################
+# MAIN Chat Loop
+#######################################
 def main():
-    """
-    Main function for user interaction and response generation.
-    """
-    print("Welcome to MetaboChat!")
-    print("Ask questions naturally and deepseek will provide you with the most relevant information.")
+    print("Welcome to MetaboChat with Weighted FTS!")
+    print("Ask a question about a metabolite name, disease, or pathway. Type 'exit' to quit.")
 
     while True:
-        prompt = input("\nEnter your query (or type 'exit' to quit): ").strip()
-
+        prompt = input("\nEnter your query: ").strip()
         if not prompt:
-            print("\n[Error]: Please enter a valid question.")
+            print("[Error]: Please enter a valid question.")
             continue
 
         if prompt.lower() == "exit":
-            print("Exiting MetaboChat. Goodbye!")
+            print("Goodbye!")
             break
 
-        db_response, raw_results, headers = query_database(prompt)
+        # Query DB
+        db_response, raw_results, used_headers = query_database(prompt)
 
+        # If we have data from DB, combine with LLM. Otherwise, free LLM response.
         if db_response and db_response != "No relevant database entries found.":
-            print("\n[Database Knowledge]:")
+            print("\n[Database Output]:")
             print(db_response)
-            final_answer = synthesize_response(prompt, db_response)
+            final = synthesize_response(prompt, db_response)
             print("\n[Final Answer]:")
-            print(final_answer)
+            print(final)
         else:
+            print("\n[No direct DB match or empty] => LLM fallback.")
+            fallback_resp = generate_response(prompt)
             print("\n[LLM Response]:")
-            print(generate_response(prompt))
+            print(fallback_resp)
 
 if __name__ == "__main__":
     main()

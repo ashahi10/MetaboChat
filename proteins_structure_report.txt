@@ -1,0 +1,7 @@
+Analyzed up to 10 entries from ./data/hmdb_proteins.xml
+
+PATH			OCCURRENCES
+--------------------------------------------
+metabolite		10
+metabolite/accession		10
+metabolite/name		10
