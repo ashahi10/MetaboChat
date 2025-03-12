@@ -23,3 +23,8 @@ logs/
 # Ignore large files
 *.safetensors
 *.ckpt
+
+*.csv
+*.json
+*.txt
+*.tsv
